@@ -98,6 +98,7 @@ contract GuessSettleV6 is MerkleBuilder {
     error CcipFeeErr();
     error VRFRequestFailedErr();
     error FinalizedErr();
+    error OutOfBoundsErr();
 
     // ==================== 常量（沿用 V5.8 口径） ====================
     uint64 public constant CIRCLE_TOLERANCE = 100000;      // 决胜圈：diff <= 10.0000 U
@@ -128,7 +129,7 @@ contract GuessSettleV6 is MerkleBuilder {
 
     // ==================== 结算轮状态 ====================
     // 0=None 1=AwaitPrice 2=Diffs 3=Sort 4=Groups 5=GroupsAssign(决胜第二遍)
-    // 6=Leaves 7=Root 8=Ready 9=Published 10=Voiding 11=Voided 12=Empty
+    // 6=Leaves 7=Root 8=Ready 9=Published 10=Voiding 11=Voided 12=Empty 13=EmptyPublished
     struct SRound {
         uint8 state;
         uint64 priceTime;
@@ -139,6 +140,7 @@ contract GuessSettleV6 is MerkleBuilder {
         uint256 betCount;     // 注数 = 票数（统一票面）
         uint256 t;            // 总投注额 = betCount × ticket
         uint256 poolBefore;
+        uint256 poolBonus;    // 本论结算时新周期快照注入的赞助（BSC 镜像连续性校验用）
         uint256 rake;
         uint256 smallFund;
         uint256 smallPaid;
@@ -225,6 +227,7 @@ contract GuessSettleV6 is MerkleBuilder {
     event RakeAccrued(uint256 indexed rid, uint256 rakeDelta, uint256 totalRake);
     event VoidStarted(uint256 indexed rid, string reason);
     event VoidPublished(uint256 indexed rid, bytes32 fastMessageId, bytes32 finalMessageId);
+    event EmptyPublished(uint256 indexed rid, bytes32 fastMessageId, bytes32 finalMessageId);
     event PoolBonusApplied(uint256 indexed cycleId, uint256 indexed roundId, uint256 amount, uint256 poolAfter);
     event CycleStarted(uint256 indexed cycleId, uint256 maxRounds, uint256 minVrfJackpot);
     event CcipConfigUpdated(address router, uint64 selector, address receiver);
@@ -288,7 +291,12 @@ contract GuessSettleV6 is MerkleBuilder {
         nextMinVrfJackpot = minVrfJackpot;
     }
 
+    /// @notice 下一周期普通奖参数（与 V5.8 setSmallPrizeConfig 相同边界校验；BSC 镜像侧同值同校验）
     function setSmallPrizeConfig(uint256 smallBps, uint256 minSmallBets, uint256 winCapBps) external onlyOwner {
+        if (minSmallBets < 10) revert OutOfBoundsErr();
+        if (smallBps < 2000 || smallBps > 8000) revert OutOfBoundsErr();
+        if (winCapBps < 300 || winCapBps > 6000) revert OutOfBoundsErr();
+        if (smallBps * 10 < winCapBps * 13) revert SmallFundInvariantErr();
         NEXT_SMALL_BPS = smallBps;
         NEXT_MIN_SMALL_BETS = minSmallBets;
         NEXT_WIN_CAP_BPS = winCapBps;
@@ -436,6 +444,7 @@ contract GuessSettleV6 is MerkleBuilder {
             WIN_CAP_BPS = NEXT_WIN_CAP_BPS;
             if (nextCyclePoolBonus > 0) {
                 pool += nextCyclePoolBonus;
+                s.poolBonus = nextCyclePoolBonus;
                 emit PoolBonusApplied(cycleId, rid, nextCyclePoolBonus, pool);
                 nextCyclePoolBonus = 0;
             }
@@ -715,15 +724,55 @@ contract GuessSettleV6 is MerkleBuilder {
 
     // ==================== 阶段 7：CCIP 双消息发布 ====================
     /// @notice 向 BSC GuessV6 发送 FTF 快消息 + 全终局慢消息；消息体含全部镜像账务字段。
-    /// @dev BSC 侧职责：幂等接收（roundId 唯一）、按相同整数公式复算守恒、
-    ///      快消息记账（可继续玩）、慢消息终审（解锁提现）；两消息不一致 → 冻结告警。
+    /// @dev 消息布局（settlement / void / empty 三种 msgType 统一 21 字段）：
+    ///      (uint8 msgType, uint8 fin, uint256 rid, uint256 cycleId,
+    ///       bytes32 betRoot, bytes32 settlementRoot, uint64 settlePrice, uint64 bestDiff, bool burst,
+    ///       uint256 betCount, uint256 t, uint256 totalPayout, uint256 rake,
+    ///       uint256 poolBefore, uint256 poolAfter, uint256 fee,
+    ///       uint256 minSmallBets, uint256 smallBps, uint256 winCapBps, uint256 poolBonus)
+    ///      fin: 0=FTF 快消息（BSC 记账、可继续玩）；1=全终局（解锁提现）。
+    ///      BSC 侧职责：幂等接收（roundId 唯一）、按相同整数公式复算守恒、
+    ///      两消息不一致 → 冻结告警 + 在账回滚。
     function publish(uint256 rid) external {
         SRound storage s = srounds[rid];
         if (s.state != 8) revert WrongStateErr();
         if (address(ccipRouter) == address(0) || bscReceiver == address(0)) revert CcipNotConfiguredErr();
 
-        bytes memory data = abi.encode(
-            uint8(0),            // msgType: 0=settlement
+        (bytes32 fastId, bytes32 finalId) = _sendTwo(
+            _settlePayload(rid, s, 0, 0),
+            _settlePayload(rid, s, 0, 1)
+        );
+
+        // 周期记账：决胜轮终结周期；普通轮累计有效轮数
+        if (s.burst) needNewCycle = true;
+        else cycleRoundCount += 1;
+
+        s.state = 9;
+        emit Published(rid, fastId, finalId, pool);
+    }
+
+    /// @notice 空局心跳消息：推动 BSC 终局水位线越过空局轮次（否则空局期间玩家提现闸门无法解锁）。
+    /// @dev 空局无账务、不占周期；msgType=2，poolBefore==poolAfter，poolBonus=0（赞助只在首个有注轮快照）。
+    function publishEmpty(uint256 rid) external {
+        SRound storage s = srounds[rid];
+        if (s.state != 12) revert WrongStateErr();
+        if (address(ccipRouter) == address(0) || bscReceiver == address(0)) revert CcipNotConfiguredErr();
+
+        (bytes32 fastId, bytes32 finalId) = _sendTwo(
+            _emptyPayload(rid, 0),
+            _emptyPayload(rid, 1)
+        );
+        s.state = 13;
+        emit EmptyPublished(rid, fastId, finalId);
+    }
+
+    /// @dev 统一载荷：结算消息（msgType=0）。
+    function _settlePayload(uint256 rid, SRound storage s, uint8 msgType, uint8 fin)
+        internal view returns (bytes memory)
+    {
+        return abi.encode(
+            msgType,
+            fin,
             rid,
             cycleId,
             s.betRoot,
@@ -737,31 +786,78 @@ contract GuessSettleV6 is MerkleBuilder {
             s.rake,
             s.poolBefore,
             pool,                // poolAfter（决胜轮已归零）
-            s.fee
+            s.fee,
+            MIN_SMALL_BETS,
+            SMALL_BPS,
+            WIN_CAP_BPS,
+            s.poolBonus
         );
-
-        (bytes32 fastId, bytes32 finalId) = _sendTwo(data);
-
-        // 周期记账：决胜轮终结周期；普通轮累计有效轮数
-        if (s.burst) needNewCycle = true;
-        else cycleRoundCount += 1;
-
-        s.state = 9;
-        emit Published(rid, fastId, finalId, pool);
     }
 
-    /// @dev 同一载荷发两条：FTF 快通道 + 全终局慢通道；费用原生币支付。
-    function _sendTwo(bytes memory data) internal returns (bytes32 fastId, bytes32 finalId) {
+    /// @dev 统一载荷：流局消息（msgType=1）。poolAfter 为回滚后的 pool（== poolBefore）。
+    function _voidPayload(uint256 rid, SRound storage s, uint8 fin) internal view returns (bytes memory) {
+        return abi.encode(
+            uint8(1),
+            fin,
+            rid,
+            cycleId,
+            s.betRoot,
+            bytes32(0),          // 无 SettlementRoot
+            uint64(0),
+            s.bestDiff,
+            false,
+            s.betCount,
+            s.t,
+            uint256(0),
+            uint256(0),
+            s.poolBefore,
+            pool,
+            uint256(0),
+            MIN_SMALL_BETS,
+            SMALL_BPS,
+            WIN_CAP_BPS,
+            s.poolBonus
+        );
+    }
+
+    /// @dev 统一载荷：空局心跳（msgType=2）。不带账务；betCount=0。
+    function _emptyPayload(uint256 rid, uint8 fin) internal view returns (bytes memory) {
+        return abi.encode(
+            uint8(2),
+            fin,
+            rid,
+            cycleId,
+            bytes32(0),
+            bytes32(0),
+            uint64(0),
+            uint64(0),
+            false,
+            uint256(0),
+            uint256(0),
+            uint256(0),
+            uint256(0),
+            pool,
+            pool,
+            uint256(0),
+            MIN_SMALL_BETS,
+            SMALL_BPS,
+            WIN_CAP_BPS,
+            uint256(0)
+        );
+    }
+
+    /// @dev 同一轮发两条消息：FTF 快通道 + 全终局慢通道；费用原生币支付。
+    function _sendTwo(bytes memory fastData, bytes memory finalData) internal returns (bytes32 fastId, bytes32 finalId) {
         Client.EVM2AnyMessage memory mFast = Client.EVM2AnyMessage({
             receiver: abi.encode(bscReceiver),
-            data: data,
+            data: fastData,
             tokenAmounts: new Client.EVMTokenAmount[](0),
             feeToken: address(0),
             extraArgs: fastExtraArgs
         });
         Client.EVM2AnyMessage memory mFinal = Client.EVM2AnyMessage({
             receiver: abi.encode(bscReceiver),
-            data: data,
+            data: finalData,
             tokenAmounts: new Client.EVMTokenAmount[](0),
             feeToken: address(0),
             extraArgs: finalExtraArgs
@@ -806,24 +902,10 @@ contract GuessSettleV6 is MerkleBuilder {
         SRound storage s = srounds[rid];
         if (s.state != 10) revert WrongStateErr();
         if (address(ccipRouter) == address(0) || bscReceiver == address(0)) revert CcipNotConfiguredErr();
-        bytes memory data = abi.encode(
-            uint8(1),            // msgType: 1=void
-            rid,
-            cycleId,
-            s.betRoot,
-            bytes32(0),
-            uint64(0),
-            s.bestDiff,
-            false,
-            s.betCount,
-            s.t,
-            uint256(0),
-            uint256(0),
-            s.poolBefore,
-            pool,
-            uint256(0)
+        (bytes32 fastId, bytes32 finalId) = _sendTwo(
+            _voidPayload(rid, s, 0),
+            _voidPayload(rid, s, 1)
         );
-        (bytes32 fastId, bytes32 finalId) = _sendTwo(data);
         s.state = 11;
         emit VoidPublished(rid, fastId, finalId);
     }
@@ -847,10 +929,17 @@ contract GuessSettleV6 is MerkleBuilder {
         return _diffs[rid][index];
     }
 
-    /// @notice 票价阶梯：pool >= 10万 × 票价 时票价翻倍（复刻 V5 ticketForPool 口径，待与原实现核对）
-    function ticketForPool(uint256 p) public pure returns (uint256 ticket) {
-        ticket = BASE_TICKET;
-        while (p >= LADDER_LINE * ticket) ticket *= 2;
+    /// @notice 票价阶梯（与 V5.8 ticketForPool 逐字一致）：1→2→5→10→20→50…
+    /// @dev 升档线：pool(wei) >= 10万 × 当前票价(wei) → 升档； mantissa 在 1/2/5 间循环，exp 进位。
+    function ticketForPool(uint256 p) public pure returns (uint256) {
+        uint256 mantissa = 1;
+        uint256 exp = 0;
+        while (p >= LADDER_LINE * mantissa * (10 ** exp) * 1e18) {
+            if (mantissa == 1) mantissa = 2;
+            else if (mantissa == 2) mantissa = 5;
+            else { mantissa = 1; exp += 1; }
+        }
+        return mantissa * (10 ** exp) * 1e18;
     }
 
     // ==================== 内部：档位 / 预言机 ====================
