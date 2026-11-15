@@ -70,4 +70,3 @@ func main() {
         _ = httpSrv.Shutdown(shutdownCtx)
         _ = sub.Close()
 }
-root@ip-172-31-28-60:~/relay-go# 
