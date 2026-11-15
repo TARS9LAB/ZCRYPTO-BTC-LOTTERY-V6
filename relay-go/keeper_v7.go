@@ -20,6 +20,7 @@ import (
 
 const keeperTestChainID = 6343
 
+// Keeper 运行参数、链上合约地址和本机待确认交易信息。
 type KeeperV7 struct {
         sub          *Submitter
         settle       common.Address
@@ -37,6 +38,7 @@ type KeeperV7 struct {
         lastDryRunAt  time.Time
 }
 
+// 初始化 Keeper：校验测试网 ChainID、环境参数、合约部署和 Guess/Settle 双向绑定。
 func NewKeeperV7(ctx context.Context, sub *Submitter) (*KeeperV7, error) {
         if sub.chainID.Cmp(big.NewInt(keeperTestChainID)) != 0 || sub.cfg.ChainID != keeperTestChainID {
                 return nil, fmt.Errorf("Keeper 只允许 MegaETH TESTNET chainId=%d", keeperTestChainID)
@@ -45,6 +47,7 @@ func NewKeeperV7(ctx context.Context, sub *Submitter) (*KeeperV7, error) {
         if !common.IsHexAddress(v) {
                 return nil, errors.New("需要配置 RELAY_SETTLE_CONTRACT（GuessSettleV7 测试网地址）")
         }
+        // 默认每次处理 50 注/组；可由环境变量覆盖，最大允许值为 500。
         k := &KeeperV7{sub: sub, settle: common.HexToAddress(v), enabled: os.Getenv("RELAY_KEEPER_ENABLED") == "1", delay: 2 * time.Second, maxBets: 50, maxGroups: 50, maxSortSteps: 50}
         for _, x := range []struct {
                 env string
@@ -84,6 +87,7 @@ func NewKeeperV7(ctx context.Context, sub *Submitter) (*KeeperV7, error) {
         return k, nil
 }
 
+// 通用只读调用：按函数选择器和 uint256 参数拼装 ABI 数据，执行 eth_call。
 func (k *KeeperV7) read(ctx context.Context, to common.Address, sig string, args ...uint64) ([]byte, error) {
         data := append([]byte{}, selectorOf(sig)...)
         for _, v := range args {
@@ -92,6 +96,7 @@ func (k *KeeperV7) read(ctx context.Context, to common.Address, sig string, args
         return k.sub.ec.CallContract(ctx, ethereum.CallMsg{To: &to, Data: data}, nil)
 }
 
+// 从 ABI 返回值中读取指定位置的 32 字节无符号整数。
 func keeperWord(b []byte, i int) (*big.Int, error) {
         if len(b) < (i+1)*32 {
                 return nil, fmt.Errorf("ABI 输出过短: got %d need %d", len(b), (i+1)*32)
@@ -99,6 +104,7 @@ func keeperWord(b []byte, i int) (*big.Int, error) {
         return new(big.Int).SetBytes(b[i*32 : (i+1)*32]), nil
 }
 
+// 读取合约的 uint256 返回值，并检查能否安全转换为 uint64。
 func (k *KeeperV7) readUint(ctx context.Context, to common.Address, sig string, args ...uint64) (uint64, error) {
         b, e := k.read(ctx, to, sig, args...)
         if e != nil {
@@ -114,6 +120,7 @@ func (k *KeeperV7) readUint(ctx context.Context, to common.Address, sig string, 
         return w.Uint64(), nil
 }
 
+// 读取合约 address 返回值，取 ABI 字槽最后 20 字节。
 func (k *KeeperV7) readAddress(ctx context.Context, to common.Address, sig string) (common.Address, error) {
         b, e := k.read(ctx, to, sig)
         if e != nil {
@@ -125,6 +132,7 @@ func (k *KeeperV7) readAddress(ctx context.Context, to common.Address, sig strin
         return common.BytesToAddress(b[12:32]), nil
 }
 
+// 从 srounds 读取的、用于推进状态机的最小轮次状态集合。
 type keeperRound struct {
         State      uint8
         PriceTime  uint64
@@ -135,19 +143,23 @@ type keeperRound struct {
         GroupCount uint64
 }
 
+// 读取结算合约的轮次状态；字段位置与当前 ABI 强绑定，版本升级需重新核对。
 func (k *KeeperV7) round(ctx context.Context, rid uint64) (keeperRound, error) {
         b, e := k.read(ctx, k.settle, "srounds(uint256)", rid)
         if e != nil {
                 return keeperRound{}, e
         }
+        // 这里按旧 ABI 预期至少 36 个字槽；升级 V7.8 时需重点核对。
         if len(b) < 36*32 {
                 return keeperRound{}, fmt.Errorf("srounds 返回 %d bytes，不符合预期36字段，禁止自动结算", len(b))
         }
         x := func(i int) uint64 { v, _ := keeperWord(b, i); return v.Uint64() }
+        // VRF 请求 ID 在 ABI 返回值中的固定下标为 23。
         req, _ := keeperWord(b, 23)
         return keeperRound{State: uint8(x(0)), PriceTime: x(1), BetCount: x(6), DiffCursor: x(24), VRFReady: x(21) != 0, VRFRequest: req, GroupCount: x(16)}, nil
 }
 
+// 构造状态迁移交易的调用数据：函数选择器后依次编码 uint256 参数。
 func keeperCalldata(sig string, nums ...uint64) []byte {
         b := append([]byte{}, selectorOf(sig)...)
         for _, n := range nums {
@@ -157,6 +169,7 @@ func keeperCalldata(sig string, nums ...uint64) []byte {
 }
 
 // 合约多阶段交易之前使用 eth_call 模拟；模拟失败时不广播。
+// 发送前执行 eth_call 预检；未启用写入时仅记录 DRY-RUN，启用后通过 Submitter 发送。
 func (k *KeeperV7) submit(ctx context.Context, to common.Address, name string, data []byte) error {
     ////
     // 测试模式：只允许 startRound
@@ -165,7 +178,6 @@ func (k *KeeperV7) submit(ctx context.Context, to common.Address, name string, d
         !strings.HasPrefix(name, "startRound(") {
         return nil
     }
-    
     // 测试模式：只允许 closeRound
     if k.enabled &&
         os.Getenv("RELAY_KEEPER_CLOSE_ONLY") == "1" &&
@@ -173,36 +185,41 @@ func (k *KeeperV7) submit(ctx context.Context, to common.Address, name string, d
         return nil
     }
     //////
-        _, err := k.sub.ec.CallContract(ctx, ethereum.CallMsg{From: k.sub.from, To: &to, Data: data}, nil)
-        if err != nil {
+    // 使用与真实发送者相同的 From 做预检，尽早识别权限和状态错误。
+    _, err := k.sub.ec.CallContract(ctx, ethereum.CallMsg{From: k.sub.from, To: &to, Data: data}, nil)
+    if err != nil {
                 return fmt.Errorf("%s 预检拒绝: %w", name, err)
-        }
-        if !k.enabled {
+    }
+    if !k.enabled {
                 if k.lastDryRun != name || time.Since(k.lastDryRunAt) > 30*time.Second {
                         log.Printf("[%s/keeper] DRY-RUN %s", k.sub.cfg.RelayID, name)
                         k.lastDryRun = name
                         k.lastDryRunAt = time.Now()
                 }
                 return nil
-        }
-        tx, e := k.sub.buildAndSendTo(ctx, to, data)
-        if tx != nil {
+     }
+     // 交易由统一 Submitter 发送，共享其钱包、Nonce 管理及 WAL 行为。
+     tx, e := k.sub.buildAndSendTo(ctx, to, data)
+     if tx != nil {
                 k.pendingHash = tx.Hash()
                 k.pendingAction = name
                 k.pendingAt = time.Now()
                 log.Printf("[%s/keeper] submitted %s tx=%s err=%v", k.sub.cfg.RelayID, name, tx.Hash(), e)
-        }
-        if e != nil {
+     }
+     if e != nil {
                 return e
-        }
-        return nil
+     }
+     return nil
 }
 
+// 检查本机上一次提交的交易是否已出回执；没有回执时阻止继续广播。
 func (k *KeeperV7) pending(ctx context.Context) (bool, error) {
         if k.pendingHash == (common.Hash{}) {
                 return false, nil
         }
+	// 只有看到链上交易回执才释放本地 pending 标记。        
         receipt, e := k.sub.ec.TransactionReceipt(ctx, k.pendingHash)
+        // 注意：当前代码无论 receipt.Status 是否成功都清 pending；仅作原逻辑说明。
         if e == nil && receipt != nil {
                 log.Printf("[%s/keeper] receipt %s status=%d tx=%s", k.sub.cfg.RelayID, k.pendingAction, receipt.Status, k.pendingHash)
                 k.pendingHash = common.Hash{}
@@ -218,6 +235,7 @@ func (k *KeeperV7) pending(ctx context.Context) (bool, error) {
 
 // Chainlink priceTime 要求 A.updatedAt <= priceTime < B.updatedAt。
 // 只在当前 phase 内二分；旧 phase / 缺失的下一跳一律等待，不猜测价格。
+// 在当前 Chainlink phase 二分寻找价格时间之前的最新轮，并验证下一轮更新晚于目标时间。
 func (k *KeeperV7) oracleRound(ctx context.Context, target uint64) (*big.Int, error) {
         latest, e := k.read(ctx, k.feed, "latestRoundData()")
         if e != nil {
@@ -227,6 +245,7 @@ func (k *KeeperV7) oracleRound(ctx context.Context, target uint64) (*big.Int, er
         if e != nil {
                 return nil, e
         }
+	// Chainlink roundId 高位表示 phase、低 64 位表示该 phase 内序号。
         phase := new(big.Int).Rsh(new(big.Int).Set(lid), 64)
         hi := new(big.Int).And(lid, new(big.Int).SetUint64(^uint64(0))).Uint64()
         if hi == 0 {
@@ -257,6 +276,7 @@ func (k *KeeperV7) oracleRound(ctx context.Context, target uint64) (*big.Int, er
                 }
                 return stamp.Uint64(), nil
         }
+	// 二分查找更新时刻不晚于 priceTime 的最后一条价格记录。        
         lo, found := uint64(1), uint64(0)
         for lo <= hi {
                 mid := lo + (hi-lo)/2
@@ -278,6 +298,7 @@ func (k *KeeperV7) oracleRound(ctx context.Context, target uint64) (*big.Int, er
                 return nil, errors.New("Oracle target 不在当前 phase；不能自动选择过期/其他 phase 价格")
         }
         candidate := idFor(found)
+ 	// 必须存在后继 TickB，才能证明目标时间处于两个更新时间之间。
         next := new(big.Int).Add(candidate, big.NewInt(1))
         stamp, e := getStamp(next)
         if e != nil {
@@ -290,6 +311,7 @@ func (k *KeeperV7) oracleRound(ctx context.Context, target uint64) (*big.Int, er
 }
 
 // Run 由 main goroutine 启动。单台一次仅提交一个状态转换，收到回执后重读状态。
+// 启动 Keeper 主循环：每两秒轮询一次，并给每轮操作设置 12 秒超时。
 func (k *KeeperV7) Run(ctx context.Context) {
         tick := time.NewTicker(k.delay)
         defer tick.Stop()
@@ -308,6 +330,7 @@ func (k *KeeperV7) Run(ctx context.Context) {
         }
 }
 
+// 根据链上区块时间和最近轮次状态决定关局、推进结算或启动下一轮。
 func (k *KeeperV7) Tick(ctx context.Context) error {
         if waiting, e := k.pending(ctx); e != nil {
                 return e
@@ -326,12 +349,14 @@ func (k *KeeperV7) Tick(ctx context.Context) error {
         if now < genesis {
                 return nil
         }
+	// 每 600 秒一个轮次；这里按链上区块时间推导当前轮。        
         current := (now-genesis)/600 + 1
         last, e := k.readUint(ctx, k.sub.contract, "lastStartedRid()")
         if e != nil {
                 return e
         }
-        // 优先处理上一轮；等链上达到经济终态后再尝试开局。
+	// 优先处理上一轮；等链上达到经济终态后再尝试开局。
+	// 始终先检查上一轮，禁止旧轮次未完成就盲目开启新轮次。        
         if last > 0 {
                 r, e := k.sub.rounds(ctx, new(big.Int).SetUint64(last))
                 if e != nil {
@@ -354,6 +379,7 @@ func (k *KeeperV7) Tick(ctx context.Context) error {
                         }
                 }
         }
+	// 距离当前轮起点超过 120 秒时不再尝试补开该轮。        
         if now >= genesis+(current-1)*600+120 {
                 return nil
         }
@@ -364,6 +390,7 @@ func (k *KeeperV7) Tick(ctx context.Context) error {
         if r.BettingClose != 0 {
                 return nil
         }
+	// 始终先检查上一轮，禁止旧轮次未完成就盲目开启新轮次。        
         if last > 0 {
                 finalData, e := k.read(ctx, k.settle, "isRoundFinal(uint256)", last)
                 if e != nil {
@@ -380,11 +407,13 @@ func (k *KeeperV7) Tick(ctx context.Context) error {
         return k.submit(ctx, k.sub.contract, fmt.Sprintf("startRound(%d)", current), keeperCalldata("startRound(uint256)", current))
 }
 
+// 按结算状态生成下一阶段交易；不在未知或需人工干预的状态下自动退款。
 func (k *KeeperV7) advanceSettlement(ctx context.Context, rid, now uint64, s keeperRound) error {
         name := ""
         to := k.settle
         var data []byte
         switch s.State {
+	// 状态 0：初始化结算轮次。                
         case 0:
                 name = "beginRound"
                 data = keeperCalldata("beginRound(uint256)", rid)
