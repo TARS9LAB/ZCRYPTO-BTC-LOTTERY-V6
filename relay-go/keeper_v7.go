@@ -4,7 +4,6 @@ package main
 // 共享现有 RELAY Submitter 的发送钱包、Nonce 锁与 WAL；同一个 Go 进程中独立 goroutine。
 // 默认只读；设置 RELAY_KEEPER_ENABLED=1 才允许开局及结算交易。
 // 所有决定都以链上状态为准，不依赖 Redis/MySQL 或其它 RELAY。
-
 import (
         "context"
         "errors"
@@ -15,7 +14,6 @@ import (
         "strconv"
         "strings"
         "time"
-
         "github.com/ethereum/go-ethereum"
         "github.com/ethereum/go-ethereum/common"
 )
@@ -93,12 +91,14 @@ func (k *KeeperV7) read(ctx context.Context, to common.Address, sig string, args
         }
         return k.sub.ec.CallContract(ctx, ethereum.CallMsg{To: &to, Data: data}, nil)
 }
+
 func keeperWord(b []byte, i int) (*big.Int, error) {
         if len(b) < (i+1)*32 {
                 return nil, fmt.Errorf("ABI 输出过短: got %d need %d", len(b), (i+1)*32)
         }
         return new(big.Int).SetBytes(b[i*32 : (i+1)*32]), nil
 }
+
 func (k *KeeperV7) readUint(ctx context.Context, to common.Address, sig string, args ...uint64) (uint64, error) {
         b, e := k.read(ctx, to, sig, args...)
         if e != nil {
@@ -113,6 +113,7 @@ func (k *KeeperV7) readUint(ctx context.Context, to common.Address, sig string, 
         }
         return w.Uint64(), nil
 }
+
 func (k *KeeperV7) readAddress(ctx context.Context, to common.Address, sig string) (common.Address, error) {
         b, e := k.read(ctx, to, sig)
         if e != nil {
@@ -378,6 +379,7 @@ func (k *KeeperV7) Tick(ctx context.Context) error {
         }
         return k.submit(ctx, k.sub.contract, fmt.Sprintf("startRound(%d)", current), keeperCalldata("startRound(uint256)", current))
 }
+
 func (k *KeeperV7) advanceSettlement(ctx context.Context, rid, now uint64, s keeperRound) error {
         name := ""
         to := k.settle
